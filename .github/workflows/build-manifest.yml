@@ -1,0 +1,40 @@
+name: build-manifest
+
+# 夜間の自動リサーチが news/YYYYMMDD.md を追加したら、
+# news/index.json（日付マニフェスト）を md 群から再生成してコミットする。
+# 生成側は md を置くだけでよく、マニフェストの整合はここで担保する。
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "news/**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-manifest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: リポジトリを取得する
+        uses: actions/checkout@v4
+
+      - name: マニフェストを再生成する
+        run: python3 scripts/build_manifest.py
+
+      - name: 差分があればコミットする
+        run: |
+          if git diff --quiet -- news/index.json; then
+            echo "マニフェストに変更なし。コミットをスキップします。"
+            exit 0
+          fi
+
+          git config user.name "news-viewer bot"
+          git config user.email "actions@github.com"
+          git add news/index.json
+          git commit -m "chore(news): マニフェストを再生成"
+          git push
