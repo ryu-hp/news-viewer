@@ -1,0 +1,172 @@
+name: merge-news-branches
+
+# 夜間の自動リサーチは main ではなく側ブランチ main-XXXXXX へ push され、
+# その後 main へ自動マージされる。この自動マージが失敗した日は PR が open のまま
+# 放置され、news/YYYYMMDD.md が main に載らずビューワーに表示されない。
+#
+# このワークフローは毎朝、取りこぼした側ブランチから news/YYYYMMDD.md だけを
+# ファイル単位で main に取り込み、マニフェストを再生成し、取り込み済みの
+# 側ブランチを削除する。対象がなければ何もせず正常終了する（冪等）。
+
+on:
+  schedule:
+    # UTC 21:10 = JST 6:10（朝の更新の後）
+    - cron: "10 21 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: merge-news-branches
+  cancel-in-progress: false
+
+jobs:
+  merge-news-branches:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: リポジトリを取得する
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: 側ブランチから日次mdを取り込む
+        id: import
+        run: |
+          set -euo pipefail
+
+          git fetch origin --prune "+refs/heads/*:refs/remotes/origin/*"
+
+          imported=()
+          deletable=()
+          skipped=()
+
+          branches="$(git for-each-ref --format='%(refname:short)' refs/remotes/origin \
+            | sed 's#^origin/##' \
+            | grep -E '^main-[0-9a-zA-Z]{4,12}$' || true)"
+
+          for branch in $branches; do
+            # main は絶対に対象にしない（命名規則上ありえないが二重で防ぐ）
+            if [ "$branch" = "main" ]; then
+              continue
+            fi
+
+            # 想定外のファイルを含むブランチは丸ごとスキップする
+            unexpected="$(git diff --name-only "origin/main...origin/$branch" \
+              | grep -vE '^(news/[0-9]{8}\.md|news/index\.json|index\.html)$' || true)"
+
+            if [ -n "$unexpected" ]; then
+              skipped+=("$branch（想定外ファイルを含む）")
+              continue
+            fi
+
+            pending=0
+
+            # 既存mdへの変更は自動では取り込まない（main を正とし、人が判断する）
+            modified="$(git diff --name-only --diff-filter=M "origin/main...origin/$branch" -- 'news/*.md' || true)"
+
+            if [ -n "$modified" ]; then
+              skipped+=("$branch（既存mdを変更している: $(echo $modified | tr '\n' ' ')）")
+              pending=1
+            fi
+
+            # main 分岐後に新規追加された news/*.md のみを対象にする
+            added="$(git diff --name-only --diff-filter=A "origin/main...origin/$branch" -- 'news/*.md' || true)"
+
+            for file in $added; do
+              case "$file" in
+                news/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].md) ;;
+                *)
+                  pending=1
+                  continue
+                  ;;
+              esac
+
+              if [ -f "$file" ]; then
+                # main 側に既にある。内容が食い違う場合は main を正としてブランチを残す
+                if ! git diff --quiet "origin/main:$file" "origin/$branch:$file"; then
+                  skipped+=("$branch（$file が main と内容不一致）")
+                  pending=1
+                fi
+                continue
+              fi
+
+              git checkout "origin/$branch" -- "$file"
+              git add "$file"
+              imported+=("$file（元ブランチ: $branch）")
+            done
+
+            if [ "$pending" -eq 0 ]; then
+              deletable+=("$branch")
+            fi
+          done
+
+          if [ "${#imported[@]}" -gt 0 ]; then
+            python3 scripts/build_manifest.py
+            git add news/index.json
+
+            git config user.name "news-viewer bot"
+            git config user.email "actions@github.com"
+            git commit -m "chore(news): 側ブランチから日次mdを取り込み、マニフェストを再生成"
+            git push origin HEAD:main
+          fi
+
+          # push が成功してから側ブランチを削除する
+          for branch in ${deletable[@]+"${deletable[@]}"}; do
+            git push origin --delete "$branch"
+          done
+
+          {
+            echo "## 側ブランチ取り込み結果"
+            echo ""
+            echo "### 取り込んだ日次md"
+            if [ "${#imported[@]}" -gt 0 ]; then
+              printf -- '- %s\n' "${imported[@]}"
+            else
+              echo "なし"
+            fi
+            echo ""
+            echo "### 削除した側ブランチ"
+            if [ "${#deletable[@]}" -gt 0 ]; then
+              printf -- '- %s\n' "${deletable[@]}"
+            else
+              echo "なし"
+            fi
+            echo ""
+            echo "### 保留・要確認"
+            if [ "${#skipped[@]}" -gt 0 ]; then
+              printf -- '- %s\n' "${skipped[@]}"
+            else
+              echo "なし"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 直近7日の生成欠損を確認する
+        run: |
+          set -euo pipefail
+
+          git checkout main
+          git pull origin main
+
+          missing=()
+
+          for i in 1 2 3 4 5 6 7; do
+            date_id="$(TZ=Asia/Tokyo date -d "-${i} day" '+%Y%m%d')"
+            if [ ! -f "news/${date_id}.md" ]; then
+              missing+=("$date_id")
+            fi
+          done
+
+          {
+            echo ""
+            echo "### 直近7日で main に存在しない日付"
+            if [ "${#missing[@]}" -gt 0 ]; then
+              printf -- '- %s\n' "${missing[@]}"
+              echo ""
+              echo "側ブランチにも無い場合は、夜間リサーチ自体が走らなかった日です（マージでは復旧できません）。"
+            else
+              echo "なし"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
