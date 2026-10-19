@@ -1100,6 +1100,34 @@
       /* 直近の再読み込み対象（エラー時の再読込ボタン用） */
       var retryFn = null;
 
+      /* 選択中カテゴリの記憶（localStorage が使えない環境では毎回「すべて」） */
+      var CATEGORY_STORAGE_KEY = "mb-activeCategory";
+
+      function storeCategory(id) {
+        try {
+          localStorage.setItem(CATEGORY_STORAGE_KEY, id);
+        } catch (e) {
+          /* 保存できない環境では今回の表示のみ切り替える */
+        }
+      }
+
+      /* 記憶したカテゴリがその日のデータに無ければ all に戻す */
+      function restoreCategory(categories) {
+        var stored = null;
+        try {
+          stored = localStorage.getItem(CATEGORY_STORAGE_KEY);
+        } catch (e) {
+          stored = null;
+        }
+        if (!stored || stored === "all") {
+          return "all";
+        }
+        var exists = categories.some(function (cat) {
+          return cat && cat.id === stored;
+        });
+        return exists ? stored : "all";
+      }
+
       /* Elements */
       var el = {
         controls: document.getElementById("js-controls"),
@@ -1241,6 +1269,7 @@
 
         btn.addEventListener("click", function () {
           state.activeCategory = id;
+          storeCategory(id);
           renderFilters();
           renderFeed();
         });
@@ -1683,7 +1712,7 @@
           .then(function (text) {
             var data = parseMarkdown(text);
             state.categories = data.categories;
-            state.activeCategory = "all";
+            state.activeCategory = restoreCategory(state.categories);
             state.importantOnly = el.importantOnly.checked;
 
             renderHeader(data.meta);
